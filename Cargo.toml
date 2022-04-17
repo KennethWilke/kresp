@@ -1,0 +1,15 @@
+[package]
+name = "kresp"
+version = "0.1.0"
+authors = ["Kenneth Wilke <kenneth.wilke@gmail.com>"]
+edition = "2021"
+description = "My simple and ergonomic library for working with the REdis Serialization Protocol (RESP)"
+readme = "README.md"
+license = "MIT"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+thiserror = "1.0"
+anyhow = "1.0"
+bstr = "0.2.17"
