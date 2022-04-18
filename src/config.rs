@@ -1,5 +1,8 @@
+/// Structure for memory limits per-parser
 pub struct RespConfig {
+    /// This is the maximum size of an individual RESP type
     pub max_resp_size: usize,
+    /// This is the max size of the internal buffer
     pub max_buffer_size: usize,
 }
 

@@ -3,7 +3,7 @@ name = "kresp"
 version = "0.1.0"
 authors = ["Kenneth Wilke <kenneth.wilke@gmail.com>"]
 edition = "2021"
-description = "My simple and ergonomic library for working with the REdis Serialization Protocol (RESP)"
+description = "My simple and ergonomic Rust crate for working with the REdis Serialization Protocol (RESP)"
 readme = "README.md"
 license = "MIT"
 

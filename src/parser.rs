@@ -5,27 +5,36 @@ use super::buffer::*;
 use super::RespConfig;
 use super::RespType;
 
+/// Error enumeration used when a parsing error occurs
 #[derive(Error, Debug)]
 pub enum ParserError {
+    /// Error occured when reading a simple string that should end in \r\n
     #[error("Invalid RESP line read: {0}")]
     ReadlineError(String),
 
+    /// Error when an invalid size is read
     #[error("Invalid RESP size: {0}")]
     ReadsizeError(i64),
 
+    /// An internal state machine error, this should not happen, please report
+    /// if it does!
     #[error("State error: {0}")]
     StateError(String),
 
-    #[error("Invalid RESP type token: {0}")]
-    TypeTokenError(u8),
+    /// Next byte read was not a type token
+    #[error("Invalid RESP type token: {0:#?}")]
+    TypeTokenError(char),
 
+    /// Size limit hit
     #[error("RESP size exceeded")]
     SizeExceededError,
 }
 
+/// The parser itself, use [`RespParser::read`] to provide it buffers to parse
 pub struct RespParser {
     buffer: Vec<u8>,
     state: Option<Box<State>>,
+    /// Configuration structure for memory limits
     pub config: RespConfig,
 }
 
@@ -104,45 +113,67 @@ enum SimpleType {
 
 impl Default for RespParser {
     fn default() -> Self {
-        Self::new(Vec::new(), RespConfig::default())
+        Self::new(RespConfig::default())
     }
 }
 
 impl RespParser {
-    pub fn new(buffer: Vec<u8>, config: RespConfig) -> Self {
+    /// Creates a new instance, can use [`RespParser`.`default`] for common setups
+    pub fn new(config: RespConfig) -> Self {
         RespParser {
-            buffer,
+            buffer: Vec::new(),
             state: None,
             config,
         }
     }
 
-    pub fn read(&mut self, buffer: &mut Vec<u8>) -> Result<Vec<RespType>> {
-        self.buffer.append(buffer);
+    /// Copy and parses the provided buffer, returns a list of [`RespType`] variant results
+    pub fn read(&mut self, buffer: &[u8]) -> Result<Vec<RespType>> {
+        for byte in buffer {
+            self.buffer.push(*byte);
+        }
 
         if self.buffer.len() > self.config.max_buffer_size {
+            self.buffer.clear();
             return Err(ParserError::SizeExceededError.into());
         }
 
         let mut items = Vec::new();
         if let Some(state) = self.state.take() {
-            match self.get_next(*state)? {
-                Some(item) => items.push(item),
-                None => return Ok(items),
+            match self.process_state(state) {
+                Ok(result) => match result {
+                    StateResult::Incomplete(state) => {
+                        self.state = Some(state.boxed());
+                        return Ok(items)
+                    }
+                    StateResult::Done(item, end) => {
+                        self.buffer.drain(..end);
+                        items.push(item)
+                    }
+                }
+                Err(error) => {
+                    self.buffer.clear();
+                    return Err(error)
+                }
             }
         }
 
         loop {
-            let state = State::get_type(0);
-            match self.get_next(*state)? {
-                Some(item) => items.push(item),
-                None => return Ok(items),
+            match self.get_next() {
+                Ok(result) => match result {
+                    Some(item) => items.push(item),
+                    None => return Ok(items),
+                },
+                Err(error) => {
+                    self.buffer.clear();
+                    return Err(error)
+                }
             }
         }
     }
 
-    fn get_next(&mut self, state: State) -> Result<Option<RespType>> {
-        match self.get_type(&self.buffer[..], state.boxed())? {
+    fn get_next(&mut self) -> Result<Option<RespType>> {
+        match self.get_type(State::get_type(0))? {
             StateResult::Incomplete(state) => {
                 self.state = Some(state.boxed());
                 Ok(None)
@@ -154,33 +185,33 @@ impl RespParser {
         }
     }
 
-    fn process_state(&self, buffer: &[u8], state: Box<State>) -> Result<StateResult> {
+    fn process_state(&self, state: Box<State>) -> Result<StateResult> {
         match *state {
-            State::GetType { .. } => self.get_type(buffer, state),
-            State::Simple { .. } => self.get_simple(buffer, state),
-            State::BulkString { .. } => self.get_bulk_string(buffer, state),
-            State::Array { .. } => self.get_array(buffer, state),
+            State::GetType { .. } => self.get_type(state),
+            State::Simple { .. } => self.get_simple(state),
+            State::BulkString { .. } => self.get_bulk_string(state),
+            State::Array { .. } => self.get_array(state),
         }
     }
 
-    fn get_type(&self, buffer: &[u8], state: Box<State>) -> Result<StateResult> {
+    fn get_type(&self, state: Box<State>) -> Result<StateResult> {
         if let State::GetType { cursor } = *state {
-            if buffer.len() <= cursor {
+            if self.buffer.len() <= cursor {
                 return Ok(StateResult::Incomplete(State::get_type(cursor)));
             }
 
             let next_cursor = cursor + 1;
-            let state = match buffer[cursor] {
+            let state = match &self.buffer[cursor] {
                 b'+' => State::get_simple(next_cursor, SimpleType::String),
                 b'-' => State::get_simple(next_cursor, SimpleType::Error),
                 b':' => State::get_simple(next_cursor, SimpleType::Integer),
                 b'$' => State::get_bulk_string(next_cursor),
                 b'*' => State::get_array(next_cursor),
-                other => return Err(ParserError::TypeTokenError(other).into()),
+                other => return Err(ParserError::TypeTokenError(*other as char).into()),
             };
 
-            if buffer.len() > cursor + 1 {
-                self.process_state(buffer, state)
+            if self.buffer.len() > cursor + 1 {
+                self.process_state(state)
             } else {
                 Ok(StateResult::Incomplete(state.boxed()))
             }
@@ -193,14 +224,14 @@ impl RespParser {
         }
     }
 
-    fn get_simple(&self, buffer: &[u8], state: Box<State>) -> Result<StateResult> {
+    fn get_simple(&self, state: Box<State>) -> Result<StateResult> {
         if let State::Simple {
             cursor,
             start,
             simple_type,
         } = *state
         {
-            match readline(buffer, cursor, start)? {
+            match readline(&self.buffer, cursor, start)? {
                 ReadlineResult::Line { line, cursor } => {
                     if line.len() > self.config.max_resp_size {
                         return Err(ParserError::SizeExceededError.into());
@@ -230,7 +261,7 @@ impl RespParser {
         }
     }
 
-    fn get_bulk_string(&self, buffer: &[u8], state: Box<State>) -> Result<StateResult> {
+    fn get_bulk_string(&self, state: Box<State>) -> Result<StateResult> {
         if let State::BulkString {
             cursor,
             start,
@@ -238,7 +269,7 @@ impl RespParser {
         } = *state
         {
             let (cursor, size) = match string_length {
-                None => match readsize(buffer, cursor, start)? {
+                None => match readsize(&self.buffer, cursor, start)? {
                     ReadsizeResult::None(cursor) => {
                         let state = State::BulkString {
                             cursor,
@@ -259,7 +290,7 @@ impl RespParser {
                 return Err(ParserError::SizeExceededError.into());
             }
 
-            match readbuffer(buffer, cursor, size) {
+            match readbuffer(&self.buffer, cursor, size) {
                 Some((vector, end)) => {
                     let result = RespType::BulkString(vector);
                     Ok(StateResult::Done(result, end))
@@ -283,7 +314,7 @@ impl RespParser {
         }
     }
 
-    fn get_array(&self, buffer: &[u8], state: Box<State>) -> Result<StateResult> {
+    fn get_array(&self, state: Box<State>) -> Result<StateResult> {
         if let State::Array {
             cursor,
             start,
@@ -294,7 +325,7 @@ impl RespParser {
         {
             let (cursor, size) = match array_size {
                 Some(size) => (cursor, size),
-                None => match readsize(buffer, cursor, start)? {
+                None => match readsize(&self.buffer, cursor, start)? {
                     ReadsizeResult::None(cursor) => {
                         let state = State::Array {
                             cursor,
@@ -333,7 +364,7 @@ impl RespParser {
                     Some(_) => substate.take().unwrap(),
                     None => State::get_type(cursor),
                 };
-                match self.process_state(buffer, state)? {
+                match self.process_state(state)? {
                     StateResult::Done(result, end) => {
                         cursor = end;
                         elements.push(result);
@@ -367,23 +398,23 @@ mod tests {
     use super::*;
     use RespType::*;
 
-    fn test_parser_ok<T>(buffer: T) -> Vec<RespType>
+    fn test_parser_ok<'a, T>(buffer: T) -> Vec<RespType>
     where
-        Vec<u8>: From<T>,
+        &'a [u8]: From<T>,
     {
         let mut parser = RespParser::default();
-        match parser.read(&mut buffer.into()) {
+        match parser.read(buffer.into()) {
             Ok(results) => results,
             other => panic!("result was not Ok(), was {:#?}", other),
         }
     }
 
-    fn test_parser_err<T>(buffer: T)
+    fn test_parser_err<'a, T>(buffer: T)
     where
-        Vec<u8>: From<T>,
+        &'a [u8]: From<T>,
     {
         let mut parser = RespParser::default();
-        let result = parser.read(&mut buffer.into());
+        let result = parser.read(buffer.into());
         assert!(result.is_err());
     }
 
@@ -407,14 +438,14 @@ mod tests {
 
     #[test]
     fn empty_start() {
-        let results = test_parser_ok("");
+        let results = test_parser_ok(b"");
 
         assert_empty_result(results);
     }
 
     #[test]
-    fn complex_nexted() {
-        let results = test_parser_ok("*3\r\n*-1\r\n*2\r\n$5\r\nhello\r\n$5\r\nworld\r\n*5\r\n+test\r\n-test3\r\n:-12345\r\n$2\r\nab\r\n$-1\r\n");
+    fn complex_nested() {
+        let results = test_parser_ok(b"*3\r\n*-1\r\n*2\r\n$5\r\nhello\r\n$5\r\nworld\r\n*5\r\n+test\r\n-test3\r\n:-12345\r\n$2\r\nab\r\n$-1\r\n");
 
         assert_num_results(&results, 1);
         if let Array(array) = &results[0] {
@@ -442,6 +473,43 @@ mod tests {
         }
     }
 
+    #[test]
+    fn complex_nested_onebyte() -> Result<()> {
+        let mut parser = RespParser::default();
+        for byte in b"*3\r\n*-1\r\n*2\r\n$5\r\nhello\r\n$5\r\nworld\r\n*5\r\n+test\r\n-test3\r\n:-12345\r\n$2\r\nab\r\n$-1\r" {
+            let results = parser.read(&[*byte])?;
+            assert_eq!(results.len(), 0);
+        }
+
+        let results = parser.read(b"\n")?;
+
+        assert_num_results(&results, 1);
+        if let Array(array) = &results[0] {
+            assert_eq!(array.len(), 3);
+            assert_eq!(array[0], RespType::NullArray);
+            if let Array(nested) = &array[1] {
+                assert_eq!(nested.len(), 2);
+                assert_eq!(nested[0], BulkString("hello".into()));
+                assert_eq!(nested[1], BulkString("world".into()));
+            } else {
+                panic!("Nested array at pos 1 expected")
+            }
+            if let Array(mixed) = &array[2] {
+                assert_eq!(mixed.len(), 5);
+                assert_eq!(mixed[0], SimpleString("test".into()));
+                assert_eq!(mixed[1], Error("test3".into()));
+                assert_eq!(mixed[2], Integer(-12345));
+                assert_eq!(mixed[3], BulkString("ab".into()));
+                assert_eq!(mixed[4], Null);
+                Ok(())
+            } else {
+                panic!("Mixed array at pos 2 expected")
+            }
+        } else {
+            panic!("Array type expected")
+        }
+    }
+
     mod simple_string {
         use super::*;
 
@@ -461,7 +529,7 @@ mod tests {
 
         #[test]
         fn valid() {
-            let results = test_parser_ok("+Valid!\r\n");
+            let results = test_parser_ok(b"+Valid!\r\n");
 
             assert_num_results(&results, 1);
             assert_simple_string(&results, 0, "Valid!");
@@ -469,7 +537,7 @@ mod tests {
 
         #[test]
         fn valid_remainder() {
-            let results = test_parser_ok("+valid and then some\r\n+");
+            let results = test_parser_ok(b"+valid and then some\r\n+");
 
             assert_num_results(&results, 1);
             assert_simple_string(&results, 0, "valid and then some");
@@ -477,19 +545,19 @@ mod tests {
 
         #[test]
         fn valid_incomplete() {
-            let results = test_parser_ok("+OK\r");
+            let results = test_parser_ok(b"+OK\r");
 
             assert_empty_result(results);
         }
 
         #[test]
         fn invalid_char_after_cr() {
-            test_parser_err("+OK\rx");
+            test_parser_err(b"+OK\rx");
         }
 
         #[test]
         fn invalid_newline() {
-            test_parser_err("+OK\n\r\n");
+            test_parser_err(b"+OK\n\r\n");
         }
     }
 
@@ -512,7 +580,7 @@ mod tests {
 
         #[test]
         fn valid() {
-            let results = test_parser_ok("-Valid!\r\n");
+            let results = test_parser_ok(b"-Valid!\r\n");
 
             assert_num_results(&results, 1);
             assert_error(&results, 0, "Valid!");
@@ -520,7 +588,7 @@ mod tests {
 
         #[test]
         fn remainder() {
-            let results = test_parser_ok("-Valid!\r\n:");
+            let results = test_parser_ok(b"-Valid!\r\n:");
 
             assert_num_results(&results, 1);
             assert_error(&results, 0, "Valid!");
@@ -528,7 +596,7 @@ mod tests {
 
         #[test]
         fn two() {
-            let results = test_parser_ok("-Valid!\r\n-andmore\r\n");
+            let results = test_parser_ok(b"-Valid!\r\n-andmore\r\n");
 
             assert_num_results(&results, 2);
             assert_error(&results, 0, "Valid!");
@@ -555,7 +623,7 @@ mod tests {
 
         #[test]
         fn valid() {
-            let results = test_parser_ok(":1234\r\n");
+            let results = test_parser_ok(b":1234\r\n");
 
             assert_num_results(&results, 1);
             assert_integer(&results, 0, 1234);
@@ -563,7 +631,7 @@ mod tests {
 
         #[test]
         fn valid_negative() {
-            let results = test_parser_ok(":-1234\r\n");
+            let results = test_parser_ok(b":-1234\r\n");
 
             assert_num_results(&results, 1);
             assert_integer(&results, 0, -1234);
@@ -571,7 +639,7 @@ mod tests {
 
         #[test]
         fn invalid() {
-            test_parser_err(":hi\r\n");
+            test_parser_err(b":hi\r\n");
         }
     }
 
@@ -594,7 +662,7 @@ mod tests {
 
         #[test]
         fn valid() {
-            let results = test_parser_ok("$6\r\nValid!\r\n");
+            let results = test_parser_ok(b"$6\r\nValid!\r\n");
 
             assert_num_results(&results, 1);
             assert_bulk_string(&results, 0, "Valid!".as_bytes());
@@ -602,7 +670,7 @@ mod tests {
 
         #[test]
         fn two() {
-            let results = test_parser_ok("$6\r\nValid!\r\n$5\r\nwooo!\r\n");
+            let results = test_parser_ok(b"$6\r\nValid!\r\n$5\r\nwooo!\r\n");
 
             assert_num_results(&results, 2);
             assert_bulk_string(&results, 0, "Valid!".as_bytes());
@@ -611,7 +679,7 @@ mod tests {
 
         #[test]
         fn remainder() {
-            let results = test_parser_ok("$6\r\nValid!\r\n+OK");
+            let results = test_parser_ok(b"$6\r\nValid!\r\n+OK");
 
             assert_num_results(&results, 1);
             assert_bulk_string(&results, 0, "Valid!".as_bytes());
@@ -619,14 +687,14 @@ mod tests {
 
         #[test]
         fn empty() {
-            let results = test_parser_ok("$0\r\n\r\n");
+            let results = test_parser_ok(b"$0\r\n\r\n");
 
             assert_num_results(&results, 1);
         }
 
         #[test]
         fn null() {
-            let results = test_parser_ok("$-1\r\n");
+            let results = test_parser_ok(b"$-1\r\n");
 
             assert_num_results(&results, 1);
         }
@@ -648,26 +716,26 @@ mod tests {
 
         #[test]
         fn start() {
-            let results = test_parser_ok("*");
+            let results = test_parser_ok(b"*");
             assert_empty_result(results);
         }
 
         #[test]
         fn hello_world() {
-            let results = test_parser_ok("*2\r\n$5\r\nhello\r\n$5\r\nworld\r\n");
+            let results = test_parser_ok(b"*2\r\n$5\r\nhello\r\n$5\r\nworld\r\n");
 
             assert_num_results(&results, 1);
         }
 
         #[test]
         fn nested() {
-            let results = test_parser_ok("*1\r\n*3\r\n$5\r\nhello\r\n+ok\r\n*-1\r\n");
+            let results = test_parser_ok(b"*1\r\n*3\r\n$5\r\nhello\r\n+ok\r\n*-1\r\n");
             assert_num_results(&results, 1);
         }
 
         #[test]
         fn null() -> Result<()> {
-            let results = test_parser_ok("*-1\r\n");
+            let results = test_parser_ok(b"*-1\r\n");
 
             assert_num_results(&results, 1);
             match results.first().unwrap() {
@@ -683,7 +751,7 @@ mod tests {
 
         #[test]
         fn empty() {
-            let results = test_parser_ok("*0\r\n");
+            let results = test_parser_ok(b"*0\r\n");
 
             assert_num_results(&results, 1);
         }
