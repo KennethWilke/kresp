@@ -1,4 +1,4 @@
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use bstr::{ByteSlice, ByteVec};
 
 /// Enum for RESP types
@@ -104,7 +104,6 @@ impl<'a> RespType {
         RespType::array(cmd)
     }
 }
-
 
 #[cfg(test)]
 mod tests {

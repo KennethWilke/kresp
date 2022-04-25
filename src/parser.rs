@@ -144,16 +144,16 @@ impl RespParser {
                 Ok(result) => match result {
                     StateResult::Incomplete(state) => {
                         self.state = Some(state.boxed());
-                        return Ok(items)
+                        return Ok(items);
                     }
                     StateResult::Done(item, end) => {
                         self.buffer.drain(..end);
                         items.push(item)
                     }
-                }
+                },
                 Err(error) => {
                     self.buffer.clear();
-                    return Err(error)
+                    return Err(error);
                 }
             }
         }
@@ -166,7 +166,7 @@ impl RespParser {
                 },
                 Err(error) => {
                     self.buffer.clear();
-                    return Err(error)
+                    return Err(error);
                 }
             }
         }
