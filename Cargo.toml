@@ -1,6 +1,6 @@
 [package]
 name = "kresp"
-version = "0.1.0"
+version = "0.1.1"
 authors = ["Kenneth Wilke <kenneth.wilke@gmail.com>"]
 edition = "2021"
 description = "My simple and ergonomic Rust crate for working with the REdis Serialization Protocol (RESP)"
