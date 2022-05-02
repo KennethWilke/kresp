@@ -105,6 +105,31 @@ impl<'a> RespType {
     }
 }
 
+impl TryInto<String> for RespType {
+    type Error = anyhow::Error;
+
+    fn try_into(self) -> Result<String> {
+        let result = match self {
+            RespType::SimpleString(string) => string,
+            RespType::Error(error) => error,
+            RespType::Integer(integer) => integer.to_string(),
+            RespType::BulkString(string) => {
+                std::str::from_utf8(&string)?.to_string()
+            },
+            RespType::Array(array) => {
+                let mut converted = Vec::<String>::new();
+                for i in array {
+                    converted.push(i.try_into()?)
+                }
+                format!("[{}]", converted.join(", "))
+            },
+            RespType::Null => "(null)".to_string(),
+            RespType::NullArray => "[null]".to_string(),
+        };
+        Ok(result)
+    }
+}
+
 #[cfg(test)]
 mod tests {
 
